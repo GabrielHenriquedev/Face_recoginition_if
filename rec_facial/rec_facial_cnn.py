@@ -1,31 +1,35 @@
+import pickle
+import uuid
 import cv2
 import numpy as np
 import face_recognition
 import os
 
-
 class FaceRecognitionSystem:
-    def __init__(self, known_images_folder, model_file, config_file, resize_factor=0.3, process_every_n_frames=5):
-        # Inicialização dos parâmetros
+    def __init__(self, known_images_folder, model_file, config_file, resize_factor=0.3, process_every_n_frames=5, distance_threshold=0.6):
         self.known_face_encodings, self.known_face_labels = self.load_known_faces(known_images_folder)
         self.net = self.load_cnn_model(model_file, config_file)
         self.resize_factor = resize_factor
         self.process_every_n_frames = process_every_n_frames
+        self.distance_threshold = distance_threshold
 
-        # Variáveis de controle
         self.frame_count = 0
         self.face_locations = []
         self.face_labels = []
 
-        # Contadores para precisão
         self.true_positive_count = 0
         self.false_negative_count = 0
         self.false_positive_count = 0
         self.true_negative_count = 0
 
     @staticmethod
-    def load_known_faces(folder_path):
-        """Carrega todas as imagens da pasta e calcula as codificações faciais."""
+    def load_known_faces(folder_path, cache_file="face_cache.pkl", resize_width=300, resize_height=300):
+        if os.path.exists(cache_file):
+            with open(cache_file, "rb") as f:
+                print("Carregando codificações do cache...")
+                return pickle.load(f)
+
+        print("Codificações não encontradas no cache. Processando imagens...")
         face_encodings = []
         face_labels = []
 
@@ -33,27 +37,28 @@ class FaceRecognitionSystem:
             image_path = os.path.join(folder_path, file_name)
             if file_name.lower().endswith(('.png', '.jpg', '.jpeg')):
                 image = face_recognition.load_image_file(image_path)
-                encodings = face_recognition.face_encodings(image)
-
+                small_image = cv2.resize(image, (resize_width, resize_height))
+                encodings = face_recognition.face_encodings(small_image)
                 if encodings:
                     face_encodings.append(encodings[0])
-                    face_labels.append(os.path.splitext(file_name)[0])  # Usa o nome do arquivo como rótulo
+                    face_labels.append(os.path.splitext(file_name)[0])
+
+        with open(cache_file, "wb") as f:
+            pickle.dump((face_encodings, face_labels), f)
+            print("Codificações salvas no cache.")
 
         return face_encodings, face_labels
 
     @staticmethod
     def load_cnn_model(model_file, config_file):
-        """Carrega o modelo pré-treinado da CNN do OpenCV."""
         return cv2.dnn.readNetFromCaffe(config_file, model_file)
 
     def process_frame(self, frame):
-        """Redimensiona o frame e converte para RGB."""
         frame_small = cv2.resize(frame, (0, 0), fx=self.resize_factor, fy=self.resize_factor)
         rgb_small_frame = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
         return frame_small, rgb_small_frame
 
     def detect_faces(self, frame_small, rgb_small_frame):
-        """Detecta faces no frame usando a CNN e verifica o reconhecimento."""
         h, w = frame_small.shape[:2]
         blob = cv2.dnn.blobFromImage(frame_small, 1.0, (300, 300), [104.0, 177.0, 123.0], False, False)
         self.net.setInput(blob)
@@ -68,57 +73,62 @@ class FaceRecognitionSystem:
                 box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
                 (startX, startY, endX, endY) = box.astype("int")
 
-                # Ajustar as coordenadas para o frame original
                 scaled_box = (
-                    int(startY / self.resize_factor),  # top
-                    int(endX / self.resize_factor),    # right
-                    int(endY / self.resize_factor),    # bottom
-                    int(startX / self.resize_factor)   # left
+                    int(startY / self.resize_factor),
+                    int(endX / self.resize_factor),
+                    int(endY / self.resize_factor),
+                    int(startX / self.resize_factor)
                 )
                 self.face_locations.append(scaled_box)
-
-                # Reconhecimento facial
                 self.recognize_face(rgb_small_frame, (startY, endX, endY, startX))
 
     def recognize_face(self, rgb_small_frame, face_box):
-        """Reconhece uma face detectada usando as codificações faciais conhecidas."""
         face_encodings = face_recognition.face_encodings(rgb_small_frame, [face_box])
 
-        # Verifica se há codificação de face
         if face_encodings:
             matches = face_recognition.compare_faces(self.known_face_encodings, face_encodings[0])
             face_distances = face_recognition.face_distance(self.known_face_encodings, face_encodings[0])
 
             if matches:
                 best_match_index = np.argmin(face_distances)
-                if matches[best_match_index]:
+                if matches[best_match_index] and face_distances[best_match_index] < self.distance_threshold:
                     self.face_labels.append(self.known_face_labels[best_match_index])
                     self.true_positive_count += 1
                 else:
-                    self.face_labels.append("Desconhecido")
-                    self.false_negative_count += 1
+                    self.handle_unknown_face(rgb_small_frame, face_box)
             else:
-                self.face_labels.append("Desconhecido")
-                self.false_negative_count += 1
+                self.handle_unknown_face(rgb_small_frame, face_box)
         else:
             self.face_labels.append("Desconhecido")
             self.true_negative_count += 1
 
+    def handle_unknown_face(self, rgb_small_frame, face_box):
+        self.face_labels.append("Desconhecido")
+        self.false_negative_count += 1
+
+        top, right, bottom, left = face_box
+        face_image = rgb_small_frame[top:bottom, left:right]
+
+        unknown_faces_folder = "unknown_faces"
+        os.makedirs(unknown_faces_folder, exist_ok=True)
+
+        file_name = os.path.join(unknown_faces_folder, f"unknown_{uuid.uuid4().hex}.jpg")
+        cv2.imwrite(file_name, cv2.cvtColor(face_image, cv2.COLOR_RGB2BGR))
+        print(f"Rosto desconhecido salvo em: {file_name}")
+
     def annotate_frame(self, frame):
-        """Desenha os retângulos e rótulos no frame."""
         for (top, right, bottom, left), label in zip(self.face_locations, self.face_labels):
-            cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)  # Verde para faces detectadas
+            color = (0, 0, 255) if label == "Desconhecido" else (0, 255, 0)
+            cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
             cv2.putText(frame, label, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-        # Exibe a acurácia no frame
         accuracy = self.calculate_accuracy()
         cv2.putText(
-            frame, f"Acurácia: {accuracy:.2%}",
+            frame, f"Acur\u00e1cia: {accuracy:.2%}",
             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2
         )
 
     def calculate_accuracy(self):
-        """Calcula a acurácia baseada nos contadores."""
         total_predictions = (
             self.true_positive_count +
             self.false_negative_count +
@@ -130,7 +140,6 @@ class FaceRecognitionSystem:
         return 0
 
     def run(self):
-        """Executa o sistema de reconhecimento facial."""
         video_capture = cv2.VideoCapture(0)
 
         while True:
@@ -151,8 +160,6 @@ class FaceRecognitionSystem:
         video_capture.release()
         cv2.destroyAllWindows()
 
-
-# Inicializar e executar o sistema
 if __name__ == "__main__":
     face_recognition_system = FaceRecognitionSystem(
         known_images_folder="../fotos",
