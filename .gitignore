@@ -1,0 +1,11 @@
+# Ignorar imagens (fotos)
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.webp
+
+# Ignorar arquivos .pk
+*.pk

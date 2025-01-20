@@ -5,8 +5,10 @@ import numpy as np
 import face_recognition
 import os
 
+
 class FaceRecognitionSystem:
-    def __init__(self, known_images_folder, model_file, config_file, resize_factor=0.3, process_every_n_frames=5, distance_threshold=0.6):
+    def __init__(self, known_images_folder, model_file, config_file, resize_factor=0.3, process_every_n_frames=5,
+                 distance_threshold=0.6):
         self.known_face_encodings, self.known_face_labels = self.load_known_faces(known_images_folder)
         self.net = self.load_cnn_model(model_file, config_file)
         self.resize_factor = resize_factor
@@ -21,6 +23,9 @@ class FaceRecognitionSystem:
         self.false_negative_count = 0
         self.false_positive_count = 0
         self.true_negative_count = 0
+
+        # Lista para armazenar os rostos desconhecidos
+        self.known_unknown_faces = []
 
     @staticmethod
     def load_known_faces(folder_path, cache_file="face_cache.pkl", resize_width=300, resize_height=300):
@@ -58,7 +63,7 @@ class FaceRecognitionSystem:
         rgb_small_frame = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
         return frame_small, rgb_small_frame
 
-    def detect_faces(self, frame_small, rgb_small_frame):
+    def detect_faces(self, frame_small, rgb_small_frame, frame):
         h, w = frame_small.shape[:2]
         blob = cv2.dnn.blobFromImage(frame_small, 1.0, (300, 300), [104.0, 177.0, 123.0], False, False)
         self.net.setInput(blob)
@@ -80,9 +85,9 @@ class FaceRecognitionSystem:
                     int(startX / self.resize_factor)
                 )
                 self.face_locations.append(scaled_box)
-                self.recognize_face(rgb_small_frame, (startY, endX, endY, startX))
+                self.recognize_face(rgb_small_frame, (startY, endX, endY, startX), frame)
 
-    def recognize_face(self, rgb_small_frame, face_box):
+    def recognize_face(self, rgb_small_frame, face_box, frame):
         face_encodings = face_recognition.face_encodings(rgb_small_frame, [face_box])
 
         if face_encodings:
@@ -95,26 +100,43 @@ class FaceRecognitionSystem:
                     self.face_labels.append(self.known_face_labels[best_match_index])
                     self.true_positive_count += 1
                 else:
-                    self.handle_unknown_face(rgb_small_frame, face_box)
+                    self.handle_unknown_face(frame, face_box, face_encodings[0])
             else:
-                self.handle_unknown_face(rgb_small_frame, face_box)
+                self.handle_unknown_face(frame, face_box, face_encodings[0])
         else:
             self.face_labels.append("Desconhecido")
             self.true_negative_count += 1
 
-    def handle_unknown_face(self, rgb_small_frame, face_box):
+    def handle_unknown_face(self, frame, face_box, face_encoding):
+        top, right, bottom, left = face_box
+
         self.face_labels.append("Desconhecido")
         self.false_negative_count += 1
 
-        top, right, bottom, left = face_box
-        face_image = rgb_small_frame[top:bottom, left:right]
+        # Verificar se o rosto desconhecido já foi registrado
+        if not self.is_known_unknown_face(face_encoding):
+            self.save_unknown_face(face_encoding, frame)
+
+    def is_known_unknown_face(self, face_encoding, threshold=0.6):
+        for known_encoding in self.known_unknown_faces:
+            distance = np.linalg.norm(known_encoding - face_encoding)
+            if distance < threshold:
+                return True
+        return False
+
+    def save_unknown_face(self, face_encoding, frame):
+        # Salvar o rosto desconhecido na lista e na pasta
+        self.known_unknown_faces.append(face_encoding)
 
         unknown_faces_folder = "unknown_faces"
         os.makedirs(unknown_faces_folder, exist_ok=True)
 
+        # Chamar annotate_frame depois de salvar
+        self.annotate_frame(frame)
+
         file_name = os.path.join(unknown_faces_folder, f"unknown_{uuid.uuid4().hex}.jpg")
-        cv2.imwrite(file_name, cv2.cvtColor(face_image, cv2.COLOR_RGB2BGR))
-        print(f"Rosto desconhecido salvo em: {file_name}")
+        cv2.imwrite(file_name, frame)  # Salvar o frame completo com as anotações
+        print(f"Frame anotado com rosto desconhecido salvo em: {file_name}")
 
     def annotate_frame(self, frame):
         for (top, right, bottom, left), label in zip(self.face_locations, self.face_labels):
@@ -130,10 +152,10 @@ class FaceRecognitionSystem:
 
     def calculate_accuracy(self):
         total_predictions = (
-            self.true_positive_count +
-            self.false_negative_count +
-            self.false_positive_count +
-            self.true_negative_count
+                self.true_positive_count +
+                self.false_negative_count +
+                self.false_positive_count +
+                self.true_negative_count
         )
         if total_predictions > 0:
             return (self.true_positive_count + self.true_negative_count) / total_predictions
@@ -149,7 +171,7 @@ class FaceRecognitionSystem:
             frame_small, rgb_small_frame = self.process_frame(frame)
 
             if self.frame_count % self.process_every_n_frames == 0:
-                self.detect_faces(frame_small, rgb_small_frame)
+                self.detect_faces(frame_small, rgb_small_frame, frame)
 
             self.annotate_frame(frame)
 
@@ -159,6 +181,7 @@ class FaceRecognitionSystem:
 
         video_capture.release()
         cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     face_recognition_system = FaceRecognitionSystem(
