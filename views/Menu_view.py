@@ -1,7 +1,30 @@
-from PyQt5.QtWidgets import QWidget, QLabel, QLineEdit, QPushButton, QVBoxLayout, QHBoxLayout, QMessageBox
-
+import sys
+from PyQt5.QtWidgets import QWidget, QLabel, QPushButton, QVBoxLayout, QMessageBox, QApplication
+from PyQt5.QtCore import QThread, pyqtSignal
 from rec_facial.rec_facial_cnn import FaceRecognitionSystem
 from views.Cad_view import FaceRecognitionForm
+
+
+class RecognitionThread(QThread):
+    progress = pyqtSignal(str)  # Para emitir mensagens de progresso
+
+    def __init__(self, known_images_folder, model_file, config_file):
+        super().__init__()
+        self.known_images_folder = known_images_folder
+        self.model_file = model_file
+        self.config_file = config_file
+
+    def run(self):
+        try:
+            recognition_system = FaceRecognitionSystem(
+                known_images_folder=self.known_images_folder,
+                model_file=self.model_file,
+                config_file=self.config_file
+            )
+            recognition_system.run()
+            self.progress.emit("Sistema de reconhecimento facial iniciado com sucesso!")
+        except Exception as e:
+            self.progress.emit(f"Erro: {str(e)}")
 
 
 class MenuFaceRecognition(QWidget):
@@ -19,7 +42,7 @@ class MenuFaceRecognition(QWidget):
 
         # Botão para abrir o formulário
         open_form_button = QPushButton("Abrir Formulário")
-        open_form_button.clicked.connect(self.open_form)  # Conectado no AppManager
+        open_form_button.clicked.connect(self.open_form)
         layout.addWidget(open_form_button)
 
         # Botão para iniciar o sistema
@@ -39,46 +62,47 @@ class MenuFaceRecognition(QWidget):
 
         self.setLayout(layout)
 
+        # Cria a thread de reconhecimento facial
+        self.recognition_thread = None
+
     def open_form(self):
-        """
-        Abre a tela de formulário e esconde o menu principal.
-        """
         try:
-            self.form_screen = FaceRecognitionForm(parent_menu=self)  # Cria a tela do formulário com referência ao menu
-            self.form_screen.show()  # Mostra a tela do formulário
-            self.hide()  # Esconde o menu principal
+            self.form_screen = FaceRecognitionForm(parent_menu=self)
+            self.form_screen.show()
+            self.hide()
         except Exception as e:
             QMessageBox.critical(self, "Erro", f"Não foi possível abrir o formulário: {str(e)}")
 
     def start_system(self):
-        """
-        Inicia o sistema de reconhecimento facial.
-        """
         try:
             known_images_folder = "./fotos"
             model_file = "./rec_facial/res10_300x300_ssd_iter_140000_fp16.caffemodel"
             config_file = "./rec_facial/deploy.prototxt"
 
-            recognition_system = FaceRecognitionSystem(
+            # Inicia a thread para o reconhecimento facial
+            self.recognition_thread = RecognitionThread(
                 known_images_folder=known_images_folder,
                 model_file=model_file,
                 config_file=config_file
             )
-            recognition_system.run()
-
-            QMessageBox.information(self, "Sistema Iniciado",
-                                    "O sistema de reconhecimento facial foi iniciado com sucesso!")
+            self.recognition_thread.progress.connect(self.show_progress)
+            self.recognition_thread.start()  # Inicia a execução na thread separada
         except Exception as e:
             QMessageBox.critical(self, "Erro", f"Falha ao iniciar o sistema: {str(e)}")
 
+    def show_progress(self, message):
+        """Exibe as mensagens de progresso na interface gráfica."""
+        QMessageBox.information(self, "Progresso", message)
+
     def remove_student(self):
-        """
-        Remove um aluno (com lógica posterior).
-        """
         QMessageBox.warning(self, "Remover Aluno", "A funcionalidade de remoção será implementada.")
 
     def close_application(self):
-        """
-        Fecha a aplicação.
-        """
         self.close()
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    menu = MenuFaceRecognition()
+    menu.show()
+    sys.exit(app.exec_())

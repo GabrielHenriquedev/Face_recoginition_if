@@ -8,4 +8,4 @@
 *.webp
 
 # Ignorar arquivos .pk
-*.pk
+*.pkl

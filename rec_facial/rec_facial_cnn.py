@@ -4,7 +4,8 @@ import cv2
 import numpy as np
 import face_recognition
 import os
-
+from PyQt5.QtWidgets import QApplication
+from views.LoadingWindow import ProgressBarWindow
 
 class FaceRecognitionSystem:
     def __init__(self, known_images_folder, model_file, config_file, resize_factor=0.3, process_every_n_frames=5,
@@ -24,11 +25,11 @@ class FaceRecognitionSystem:
         self.false_positive_count = 0
         self.true_negative_count = 0
 
-        # Lista para armazenar os rostos desconhecidos
         self.known_unknown_faces = []
 
     @staticmethod
     def load_known_faces(folder_path, cache_file="face_cache.pkl", resize_width=300, resize_height=300):
+        # Verifica se o cache já existe para carregar codificações
         if os.path.exists(cache_file):
             with open(cache_file, "rb") as f:
                 print("Carregando codificações do cache...")
@@ -38,16 +39,47 @@ class FaceRecognitionSystem:
         face_encodings = []
         face_labels = []
 
-        for file_name in os.listdir(folder_path):
-            image_path = os.path.join(folder_path, file_name)
-            if file_name.lower().endswith(('.png', '.jpg', '.jpeg')):
-                image = face_recognition.load_image_file(image_path)
-                small_image = cv2.resize(image, (resize_width, resize_height))
-                encodings = face_recognition.face_encodings(small_image)
-                if encodings:
-                    face_encodings.append(encodings[0])
-                    face_labels.append(os.path.splitext(file_name)[0])
+        image_files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        total_images = len(image_files)
 
+        # Verifica se já existe uma instância do QApplication
+        app_instance = QApplication.instance()
+        if not app_instance:
+            app = QApplication([])  # Cria uma nova instância do QApplication se necessário
+        else:
+            app = app_instance
+
+        # Configura a barra de progresso
+        progress_window = ProgressBarWindow(total_images)
+        progress_window.show()
+
+        try:
+            for i, file_name in enumerate(image_files):
+                try:
+                    image_path = os.path.join(folder_path, file_name)
+                    image = face_recognition.load_image_file(image_path)
+
+                    # Redimensiona a imagem para processar mais rapidamente
+                    small_image = cv2.resize(image, (resize_width, resize_height))
+                    encodings = face_recognition.face_encodings(small_image)
+
+                    # Armazena a codificação e o rótulo se houver uma face detectada
+                    if encodings:
+                        face_encodings.append(encodings[0])
+                        face_labels.append(os.path.splitext(file_name)[0])
+
+                    # Atualiza a barra de progresso
+                    progress_window.update_progress(i + 1)
+                    QApplication.processEvents()  # Atualiza a interface gráfica durante o loop
+
+                except Exception as e:
+                    print(f"Erro ao processar a imagem {file_name}: {e}")
+        finally:
+            # Em vez de fechar diretamente aqui, emitimos um sinal ou retornamos a indicação de término
+            progress_window.hide()  # Apenas esconde a barra para evitar interações
+            QApplication.processEvents()  # Garante atualização final da interface gráfica
+
+        # Salva as codificações no cache
         with open(cache_file, "wb") as f:
             pickle.dump((face_encodings, face_labels), f)
             print("Codificações salvas no cache.")
@@ -113,7 +145,6 @@ class FaceRecognitionSystem:
         self.face_labels.append("Desconhecido")
         self.false_negative_count += 1
 
-        # Verificar se o rosto desconhecido já foi registrado
         if not self.is_known_unknown_face(face_encoding):
             self.save_unknown_face(face_encoding, frame)
 
@@ -125,17 +156,15 @@ class FaceRecognitionSystem:
         return False
 
     def save_unknown_face(self, face_encoding, frame):
-        # Salvar o rosto desconhecido na lista e na pasta
         self.known_unknown_faces.append(face_encoding)
 
         unknown_faces_folder = "unknown_faces"
         os.makedirs(unknown_faces_folder, exist_ok=True)
 
-        # Chamar annotate_frame depois de salvar
         self.annotate_frame(frame)
 
         file_name = os.path.join(unknown_faces_folder, f"unknown_{uuid.uuid4().hex}.jpg")
-        cv2.imwrite(file_name, frame)  # Salvar o frame completo com as anotações
+        cv2.imwrite(file_name, frame)
         print(f"Frame anotado com rosto desconhecido salvo em: {file_name}")
 
     def annotate_frame(self, frame):
@@ -181,7 +210,6 @@ class FaceRecognitionSystem:
 
         video_capture.release()
         cv2.destroyAllWindows()
-
 
 if __name__ == "__main__":
     face_recognition_system = FaceRecognitionSystem(
