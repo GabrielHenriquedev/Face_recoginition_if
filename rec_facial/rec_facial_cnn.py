@@ -4,217 +4,251 @@ import cv2
 import numpy as np
 import face_recognition
 import os
+from datetime import datetime
 from PyQt5.QtWidgets import QApplication
 from views.LoadingWindow import ProgressBarWindow
 
 class FaceRecognitionSystem:
-    def __init__(self, known_images_folder, model_file, config_file, resize_factor=0.3, process_every_n_frames=5,
-                 distance_threshold=0.6):
+    def __init__(self, known_images_folder, model_file, config_file,
+                 resize_factor=0.5, process_every_n_frames=3,
+                 distance_threshold=0.55, detection_confidence=0.7):
         self.known_face_encodings, self.known_face_labels = self.load_known_faces(known_images_folder)
         self.net = self.load_cnn_model(model_file, config_file)
         self.resize_factor = resize_factor
         self.process_every_n_frames = process_every_n_frames
         self.distance_threshold = distance_threshold
+        self.detection_confidence = detection_confidence
 
-        self.frame_count = 0
-        self.face_locations = []
-        self.face_labels = []
-
-        self.true_positive_count = 0
-        self.false_negative_count = 0
-        self.false_positive_count = 0
-        self.true_negative_count = 0
+        self.metrics = {
+            'true_positive': 0,
+            'false_positive': 0,
+            'true_negative': 0,
+            'false_negative': 0,
+            'total_faces': 0
+        }
 
         self.known_unknown_faces = []
+        self.unknown_faces_folder = "unknown_faces"
+        os.makedirs(self.unknown_faces_folder, exist_ok=True)
 
     @staticmethod
-    def load_known_faces(folder_path, cache_file="face_cache.pkl", resize_width=300, resize_height=300):
-        # Verifica se o cache já existe para carregar codificações
+    def load_known_faces(folder_path, cache_file="face_cache.pkl",
+                         target_size=(300, 300), min_faces_per_image=1):
         if os.path.exists(cache_file):
             with open(cache_file, "rb") as f:
-                print("Carregando codificações do cache...")
                 return pickle.load(f)
 
-        print("Codificações não encontradas no cache. Processando imagens...")
         face_encodings = []
         face_labels = []
 
         image_files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
         total_images = len(image_files)
 
-        # Verifica se já existe uma instância do QApplication
-        app_instance = QApplication.instance()
-        if not app_instance:
-            app = QApplication([])  # Cria uma nova instância do QApplication se necessário
-        else:
-            app = app_instance
-
-        # Configura a barra de progresso
+        app = QApplication.instance() or QApplication([])
         progress_window = ProgressBarWindow(total_images)
         progress_window.show()
 
         try:
-            for i, file_name in enumerate(image_files):
+            for i, filename in enumerate(image_files):
                 try:
-                    image_path = os.path.join(folder_path, file_name)
+                    image_path = os.path.join(folder_path, filename)
                     image = face_recognition.load_image_file(image_path)
 
-                    # Redimensiona a imagem para processar mais rapidamente
-                    small_image = cv2.resize(image, (resize_width, resize_height))
-                    encodings = face_recognition.face_encodings(small_image)
+                    face_locs = face_recognition.face_locations(image)
+                    if len(face_locs) < min_faces_per_image:
+                        continue
 
-                    # Armazena a codificação e o rótulo se houver uma face detectada
-                    if encodings:
-                        face_encodings.append(encodings[0])
-                        face_labels.append(os.path.splitext(file_name)[0])
+                    encodings = face_recognition.face_encodings(image, face_locs)
+                    for encoding in encodings:
+                        face_encodings.append(encoding)
+                        face_labels.append(os.path.splitext(filename)[0])
 
-                    # Atualiza a barra de progresso
                     progress_window.update_progress(i + 1)
-                    QApplication.processEvents()  # Atualiza a interface gráfica durante o loop
+                    QApplication.processEvents()
 
                 except Exception as e:
-                    print(f"Erro ao processar a imagem {file_name}: {e}")
+                    print(f"Erro processando {filename}: {str(e)}")
         finally:
-            # Em vez de fechar diretamente aqui, emitimos um sinal ou retornamos a indicação de término
-            progress_window.hide()  # Apenas esconde a barra para evitar interações
-            QApplication.processEvents()  # Garante atualização final da interface gráfica
+            progress_window.close()
+            QApplication.processEvents()
 
-        # Salva as codificações no cache
         with open(cache_file, "wb") as f:
             pickle.dump((face_encodings, face_labels), f)
-            print("Codificações salvas no cache.")
 
         return face_encodings, face_labels
 
-    @staticmethod
-    def load_cnn_model(model_file, config_file):
-        return cv2.dnn.readNetFromCaffe(config_file, model_file)
+    def load_cnn_model(self, model_file, config_file):
+        net = cv2.dnn.readNetFromCaffe(config_file, model_file)
+        net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+        net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+        return net
 
-    def process_frame(self, frame):
-        frame_small = cv2.resize(frame, (0, 0), fx=self.resize_factor, fy=self.resize_factor)
-        rgb_small_frame = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
-        return frame_small, rgb_small_frame
-
-    def detect_faces(self, frame_small, rgb_small_frame, frame):
+    def detect_faces(self, frame_small, rgb_small_frame, original_frame):
         h, w = frame_small.shape[:2]
-        blob = cv2.dnn.blobFromImage(frame_small, 1.0, (300, 300), [104.0, 177.0, 123.0], False, False)
+        blob = cv2.dnn.blobFromImage(frame_small, 1.0, (300, 300),
+                                     (104.0, 177.0, 123.0), False, False)
         self.net.setInput(blob)
         detections = self.net.forward()
 
-        self.face_locations.clear()
-        self.face_labels.clear()
+        face_locations = []
+        face_labels = []
+        face_confidences = []
 
         for i in range(detections.shape[2]):
             confidence = detections[0, 0, i, 2]
-            if confidence > 0.5:
+            if confidence > self.detection_confidence:
                 box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
                 (startX, startY, endX, endY) = box.astype("int")
 
-                scaled_box = (
-                    int(startY / self.resize_factor),
-                    int(endX / self.resize_factor),
-                    int(endY / self.resize_factor),
-                    int(startX / self.resize_factor)
-                )
-                self.face_locations.append(scaled_box)
-                self.recognize_face(rgb_small_frame, (startY, endX, endY, startX), frame)
+                scale = 1 / self.resize_factor
+                original_top = int(startY * scale)
+                original_right = int(endX * scale)
+                original_bottom = int(endY * scale)
+                original_left = int(startX * scale)
 
-    def recognize_face(self, rgb_small_frame, face_box, frame):
+                face_locations.append((
+                    original_top,
+                    original_right,
+                    original_bottom,
+                    original_left
+                ))
+
+                label, confidence = self.recognize_face(
+                    rgb_small_frame,
+                    (startY, endX, endY, startX),  # Coordenadas no frame pequeno
+                    original_frame,
+                    (original_top, original_right, original_bottom, original_left)  # Coordenadas no frame original
+                )
+                face_labels.append(label)
+                face_confidences.append(confidence)
+
+        return face_locations, face_labels, face_confidences
+
+    def recognize_face(self, rgb_small_frame, face_box, original_frame, face_location):
         face_encodings = face_recognition.face_encodings(rgb_small_frame, [face_box])
 
-        if face_encodings:
-            matches = face_recognition.compare_faces(self.known_face_encodings, face_encodings[0])
-            face_distances = face_recognition.face_distance(self.known_face_encodings, face_encodings[0])
+        if not face_encodings:
+            return "Desconhecido", 0.0
 
-            if matches:
-                best_match_index = np.argmin(face_distances)
-                if matches[best_match_index] and face_distances[best_match_index] < self.distance_threshold:
-                    self.face_labels.append(self.known_face_labels[best_match_index])
-                    self.true_positive_count += 1
-                else:
-                    self.handle_unknown_face(frame, face_box, face_encodings[0])
-            else:
-                self.handle_unknown_face(frame, face_box, face_encodings[0])
+        matches = face_recognition.compare_faces(
+            self.known_face_encodings, face_encodings[0],
+            tolerance=self.distance_threshold
+        )
+        face_distances = face_recognition.face_distance(
+            self.known_face_encodings, face_encodings[0]
+        )
+
+        best_match_index = np.argmin(face_distances)
+        best_distance = face_distances[best_match_index]
+        confidence = 1 - best_distance
+
+        if matches[best_match_index]:
+            self.metrics['true_positive'] += 1
+            return self.known_face_labels[best_match_index], confidence
         else:
-            self.face_labels.append("Desconhecido")
-            self.true_negative_count += 1
+            self.handle_unknown_face(face_encodings[0], original_frame, face_location)
+            self.metrics['false_negative'] += 1
+            return "Desconhecido", confidence
 
-    def handle_unknown_face(self, frame, face_box, face_encoding):
-        top, right, bottom, left = face_box
+    def handle_unknown_face(self, face_encoding, frame, face_location):
+        if not any(np.linalg.norm(known - face_encoding) < 0.5 for known in self.known_unknown_faces):
+            self.save_unknown_face(frame, face_location)
+            self.known_unknown_faces.append(face_encoding)
 
-        self.face_labels.append("Desconhecido")
-        self.false_negative_count += 1
+    def save_unknown_face(self, frame, face_location):
+        annotated_frame = frame.copy()
+        (top, right, bottom, left) = face_location
 
-        if not self.is_known_unknown_face(face_encoding):
-            self.save_unknown_face(face_encoding, frame)
+        face_locations = [face_location]  # Lista com a localização do rosto desconhecido
+        face_labels = ["Desconhecido"]  # Label do rosto desconhecido
+        face_confidences = [0.0]  # Confiança (pode ser ajustada se necessário)
 
-    def is_known_unknown_face(self, face_encoding, threshold=0.6):
-        for known_encoding in self.known_unknown_faces:
-            distance = np.linalg.norm(known_encoding - face_encoding)
-            if distance < threshold:
-                return True
-        return False
+        annotated_frame = self.annotate_frame(annotated_frame, face_locations, face_labels, face_confidences)
 
-    def save_unknown_face(self, face_encoding, frame):
-        self.known_unknown_faces.append(face_encoding)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = os.path.join(self.unknown_faces_folder, f"unknown_{timestamp}_{uuid.uuid4().hex}.jpg")
 
-        unknown_faces_folder = "unknown_faces"
-        os.makedirs(unknown_faces_folder, exist_ok=True)
+        cv2.imwrite(filename, annotated_frame)
+        print(f"Rosto desconhecido salvo com anotações: {filename}")
 
-        self.annotate_frame(frame)
+    def calculate_metrics(self):
+        total = self.metrics['total_faces']
+        if total == 0:
+            return {}
 
-        file_name = os.path.join(unknown_faces_folder, f"unknown_{uuid.uuid4().hex}.jpg")
-        cv2.imwrite(file_name, frame)
-        print(f"Frame anotado com rosto desconhecido salvo em: {file_name}")
+        precision = self.metrics['true_positive'] / (
+                self.metrics['true_positive'] + self.metrics['false_positive'] + 1e-6
+        )
+        recall = self.metrics['true_positive'] / (
+                self.metrics['true_positive'] + self.metrics['false_negative'] + 1e-6
+        )
+        f1_score = 2 * (precision * recall) / (precision + recall + 1e-6)
 
-    def annotate_frame(self, frame):
-        for (top, right, bottom, left), label in zip(self.face_locations, self.face_labels):
+        return {
+            'precision': precision,
+            'recall': recall,
+            'f1_score': f1_score,
+            'accuracy': (self.metrics['true_positive'] + self.metrics['true_negative']) / total
+        }
+
+    def annotate_frame(self, frame, face_locations, face_labels, face_confidences):
+        metrics = self.calculate_metrics()
+
+        for (top, right, bottom, left), label, confidence in zip(face_locations, face_labels, face_confidences):
             color = (0, 0, 255) if label == "Desconhecido" else (0, 255, 0)
             cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
-            cv2.putText(frame, label, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-        accuracy = self.calculate_accuracy()
-        cv2.putText(
-            frame, f"Acur\u00e1cia: {accuracy:.2%}",
-            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2
-        )
+            text = f"{label} ({confidence:.2f})" if label != "Desconhecido" else label
+            cv2.putText(frame, text, (left + 6, bottom - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-    def calculate_accuracy(self):
-        total_predictions = (
-                self.true_positive_count +
-                self.false_negative_count +
-                self.false_positive_count +
-                self.true_negative_count
-        )
-        if total_predictions > 0:
-            return (self.true_positive_count + self.true_negative_count) / total_predictions
-        return 0
+        y_offset = 30
+        for metric, value in metrics.items():
+            cv2.putText(frame, f"{metric.capitalize()}: {value:.2%}",
+                        (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7, (0, 255, 255), 2)
+            y_offset += 30
+
+        return frame
 
     def run(self):
-        video_capture = cv2.VideoCapture(0)
+        cap = cv2.VideoCapture(0)
+        frame_count = 0
+
+        face_locs = []
+        face_labels = []
+        face_confs = []
 
         while True:
-            ret, frame = video_capture.read()
-            self.frame_count += 1
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-            frame_small, rgb_small_frame = self.process_frame(frame)
+            frame_count += 1
+            frame_small = cv2.resize(frame, (0, 0), fx=self.resize_factor, fy=self.resize_factor)
+            rgb_small = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
 
-            if self.frame_count % self.process_every_n_frames == 0:
-                self.detect_faces(frame_small, rgb_small_frame, frame)
+            if frame_count % self.process_every_n_frames == 0:
+                # Atualiza as variáveis apenas quando processar
+                face_locs, face_labels, face_confs = self.detect_faces(
+                    frame_small, rgb_small, frame
+                )
+                self.metrics['total_faces'] += len(face_locs)
 
-            self.annotate_frame(frame)
+            frame = self.annotate_frame(frame, face_locs, face_labels, face_confs)
+            cv2.imshow("Sistema de Reconhecimento Facial Aprimorado", frame)
 
-            cv2.imshow("Reconhecimento Facial com CNN", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
-        video_capture.release()
+        cap.release()
         cv2.destroyAllWindows()
 
+
 if __name__ == "__main__":
-    face_recognition_system = FaceRecognitionSystem(
+    system = FaceRecognitionSystem(
         known_images_folder="../fotos",
         model_file="res10_300x300_ssd_iter_140000_fp16.caffemodel",
         config_file="deploy.prototxt"
     )
-    face_recognition_system.run()
+    system.run()
