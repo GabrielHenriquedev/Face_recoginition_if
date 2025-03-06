@@ -5,8 +5,19 @@ import numpy as np
 import face_recognition
 import os
 from datetime import datetime
+
+from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import QApplication
 from views.LoadingWindow import ProgressBarWindow
+
+# Novas importações
+import platform
+import subprocess
+from plyer import notification  # Para notificações do sistema
+import winsound  #
+
+from views.notification import NotificationWindow
+
 
 class FaceRecognitionSystem:
     def __init__(self, known_images_folder, model_file, config_file,
@@ -170,6 +181,43 @@ class FaceRecognitionSystem:
 
         cv2.imwrite(filename, annotated_frame)
         print(f"Rosto desconhecido salvo com anotações: {filename}")
+
+        self.trigger_alert_system()
+
+    def trigger_alert_system(self):
+        try:
+            self.notification = NotificationWindow()
+            self.notification.show()
+
+            QTimer.singleShot(3000, self.notification.close)
+
+            QApplication.processEvents()
+        except Exception as e:
+            print(f"Erro na notificação: {str(e)}")
+
+    def show_system_notification(self):
+        try:
+            notification.notify(
+                title="ALERTA DE SEGURANÇA",
+                message="Rosto desconhecido detectado!",
+                app_name="Sistema de Reconhecimento Facial",
+                timeout=10
+            )
+        except Exception as e:
+            print(f"Erro na notificação do sistema: {str(e)}")
+            print("Certifique-se de ter o plyer instalado: pip install plyer")
+
+    def play_alert_sound(self):
+        try:
+            if platform.system() == "Windows":
+                winsound.Beep(1000, 1000)  # Frequência 1000Hz por 1 segundo
+            elif platform.system() == "Darwin":  # macOS
+                subprocess.run(["afplay", "/System/Library/Sounds/Sosumi.aiff"])
+            else:  # Linux
+                subprocess.run(["paplay", "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga"])
+        except Exception as e:
+            print(f"Erro no alerta sonoro: {str(e)}")
+            print("\a")
 
     def calculate_metrics(self):
         total = self.metrics['total_faces']
