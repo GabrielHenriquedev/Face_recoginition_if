@@ -7,30 +7,35 @@ import os
 import json
 import time
 from datetime import datetime
-
 from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import QApplication
 from views.LoadingWindow import ProgressBarWindow
-
-# Novas importações
 import platform
 import subprocess
 from plyer import notification
 import winsound
-
 from views.notification import NotificationWindow
 
 
 class FaceRecognitionSystem:
     def __init__(self, known_images_folder, model_file, config_file,
-                 resize_factor=0.5, process_every_n_frames=3,
-                 distance_threshold=0.55, detection_confidence=0.7):
+                 resize_factor=0.5, distance_threshold=0.55, detection_confidence=0.7):
         self.known_face_encodings, self.known_face_labels = self.load_known_faces(known_images_folder)
         self.net = self.load_cnn_model(model_file, config_file)
         self.resize_factor = resize_factor
-        self.process_every_n_frames = process_every_n_frames
         self.distance_threshold = distance_threshold
         self.detection_confidence = detection_confidence
+
+        # Parâmetros de temporização
+        self.detection_interval = 0.75
+        self.recognition_interval = 1.5
+        self.last_detection_time = 0
+        self.last_recognition_time = 0
+        self.max_detection_age = 1.5
+
+        # Suavização visual
+        self.smoothed_locations = []
+        self.smoothing_factor = 0.5
 
         self.metrics = {
             'true_positive': 0,
@@ -38,19 +43,22 @@ class FaceRecognitionSystem:
             'true_negative': 0,
             'false_negative': 0,
             'total_faces': 0,
-            'processing_times': [],
+            'detection_times': [],
             'recognition_times': [],
-            'confidences': [],
+            'recognition_confidences': [],
+            'detection_confidences': [],
+            'start_time': time.time(),
+            'total_frames': 0,
             'frame_counts': 0
         }
 
         self.known_unknown_faces = []
         self.unknown_faces_folder = "unknown_faces"
         os.makedirs(self.unknown_faces_folder, exist_ok=True)
+        self.current_fps = 0.0
 
     @staticmethod
-    def load_known_faces(folder_path, cache_file="face_cache.pkl",
-                         target_size=(300, 300), min_faces_per_image=1):
+    def load_known_faces(folder_path, cache_file="face_cache.pkl", min_faces_per_image=1):
         if os.path.exists(cache_file):
             with open(cache_file, "rb") as f:
                 return pickle.load(f)
@@ -96,12 +104,16 @@ class FaceRecognitionSystem:
 
     def load_cnn_model(self, model_file, config_file):
         net = cv2.dnn.readNetFromCaffe(config_file, model_file)
-        net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
-        net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+        # Tenta configurar para CUDA, fallback para CPU se falhar
+        try:
+            net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+            net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+        except:
+            net.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
+            net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
         return net
 
-    def detect_faces(self, frame_small, rgb_small_frame, original_frame):
-        start_time = time.time()
+    def detect_faces(self, frame_small):
         h, w = frame_small.shape[:2]
         blob = cv2.dnn.blobFromImage(frame_small, 1.0, (300, 300),
                                      (104.0, 177.0, 123.0), False, False)
@@ -109,279 +121,370 @@ class FaceRecognitionSystem:
         detections = self.net.forward()
 
         face_locations = []
-        face_labels = []
-        face_confidences = []
+        detection_confidences = []
 
         for i in range(detections.shape[2]):
             confidence = detections[0, 0, i, 2]
             if confidence > self.detection_confidence:
                 box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
                 (startX, startY, endX, endY) = box.astype("int")
-
                 scale = 1 / self.resize_factor
-                original_top = int(startY * scale)
-                original_right = int(endX * scale)
-                original_bottom = int(endY * scale)
-                original_left = int(startX * scale)
-
                 face_locations.append((
-                    original_top,
-                    original_right,
-                    original_bottom,
-                    original_left
+                    int(startY * scale),
+                    int(endX * scale),
+                    int(endY * scale),
+                    int(startX * scale)
                 ))
+                detection_confidences.append(confidence)
 
-                label, confidence, recognition_time = self.recognize_face(
-                    rgb_small_frame,
-                    (startY, endX, endY, startX),
-                    original_frame,
-                    (original_top, original_right, original_bottom, original_left)
+        return face_locations, detection_confidences
+
+    def recognize_faces(self, rgb_small_frame, face_locations, detection_confidences):
+        face_labels = []
+        recognition_confidences = []
+
+        for idx, face_box in enumerate(face_locations):
+            try:
+                face_encodings = face_recognition.face_encodings(rgb_small_frame, [face_box])
+                if not face_encodings:
+                    recognition_confidences.append(0.0)
+                    face_labels.append("Desconhecido")
+                    continue
+
+                matches = face_recognition.compare_faces(
+                    self.known_face_encodings,
+                    face_encodings[0],
+                    tolerance=self.distance_threshold
                 )
-                face_labels.append(label)
-                face_confidences.append(confidence)
-                self.metrics['recognition_times'].append(recognition_time)
+                face_distances = face_recognition.face_distance(
+                    self.known_face_encodings,
+                    face_encodings[0]
+                )
+                best_match_index = np.argmin(face_distances)
+                best_distance = face_distances[best_match_index]
+                confidence = 1 - best_distance
 
-        detection_time = time.time() - start_time
-        self.metrics['processing_times'].append(detection_time)
-        return face_locations, face_labels, face_confidences
-
-    def recognize_face(self, rgb_small_frame, face_box, original_frame, face_location, true_label=None):
-        start_time = time.time()
-        face_encodings = face_recognition.face_encodings(rgb_small_frame, [face_box])
-
-        if not face_encodings:
-            recognition_time = time.time() - start_time
-            return "Desconhecido", 0.0, recognition_time
-
-        matches = face_recognition.compare_faces(
-            self.known_face_encodings, face_encodings[0],
-            tolerance=self.distance_threshold
-        )
-        face_distances = face_recognition.face_distance(
-            self.known_face_encodings, face_encodings[0]
-        )
-
-        best_match_index = np.argmin(face_distances)
-        best_distance = face_distances[best_match_index]
-        confidence = 1 - best_distance
-
-        if true_label is not None:  # Modo de avaliação
-            if matches[best_match_index]:
-                if self.known_face_labels[best_match_index] == true_label:
+                if matches[best_match_index]:
+                    label = self.known_face_labels[best_match_index]
                     self.metrics['true_positive'] += 1
                 else:
-                    self.metrics['false_positive'] += 1
-            else:
-                if true_label == "Desconhecido":
-                    self.metrics['true_negative'] += 1
-                else:
-                    self.metrics['false_negative'] += 1
-        else:  # Modo normal
-            if matches[best_match_index]:
-                self.metrics['true_positive'] += 1
-            else:
-                self.metrics['false_negative'] += 1
+                    label = "Desconhecido"
+                    # Usa o encoding facial para verificação
+                    if self.face_should_be_known(face_encodings[0]):
+                        self.metrics['false_negative'] += 1
+                    else:
+                        self.metrics['true_negative'] += 1
 
-        recognition_time = time.time() - start_time
+                    self.handle_unknown_face(
+                        face_encodings[0],
+                        face_box,
+                        detection_confidences[idx],
+                        confidence
+                    )
 
-        if matches[best_match_index]:
-            return self.known_face_labels[best_match_index], confidence, recognition_time
-        else:
-            self.handle_unknown_face(face_encodings[0], original_frame, face_location)
-            return "Desconhecido", confidence, recognition_time
+                face_labels.append(label)
+                recognition_confidences.append(confidence)
+                self.metrics['recognition_confidences'].append(confidence)
+                self.metrics['total_faces'] += 1
 
-    def calculate_metrics(self):
+            except Exception as e:
+                print(f"Erro no reconhecimento: {str(e)}")
+                face_labels.append("Erro")
+                recognition_confidences.append(0.0)
+
+        return face_labels, recognition_confidences
+
+    def execute_recognition_cycle(self):
+        """Executa um ciclo completo de detecção e reconhecimento"""
         try:
-            total = self.metrics['total_faces']
-            processing_times = self.metrics['processing_times']
-            recognition_times = self.metrics['recognition_times']
-            confidences = self.metrics['confidences']
+            # Passo 1: Detecção se necessário
+            if (time.time() - self.last_detection_time) > self.detection_interval:
+                frame_small = cv2.resize(self.current_frame, (0, 0),
+                                         fx=self.resize_factor,
+                                         fy=self.resize_factor)
+                new_locs, new_confs = self.detect_faces(frame_small)
 
-            metrics = {
-                'precision': self.metrics['true_positive'] / max(1, self.metrics['true_positive'] + self.metrics[
-                    'false_positive']),
-                'recall': self.metrics['true_positive'] / max(1, self.metrics['true_positive'] + self.metrics[
-                    'false_negative']),
-                'accuracy': (self.metrics['true_positive'] + self.metrics['true_negative']) / max(1, total),
-                'avg_detection_time': np.mean(processing_times) if processing_times else 0,
-                'avg_recognition_time': np.mean(recognition_times) if recognition_times else 0,
-                'fps': self.metrics['frame_counts'] / max(1, sum(processing_times)),
-                'avg_confidence': np.mean(confidences) if confidences else 0
-            }
-            metrics['f1_score'] = 2 * (metrics['precision'] * metrics['recall']) / max(1e-9, (
-                        metrics['precision'] + metrics['recall']))
-            return metrics
+                if new_locs:
+                    self.current_face_locations = new_locs
+                    self.current_detection_confidences = new_confs
+                    self.last_detection_time = time.time()
+
+
+            # Passo 2: Reconhecimento sempre com o frame mais recente
+            current_time = time.time()
+            if (current_time - self.last_recognition_time) >= self.recognition_interval:
+                if self.current_face_locations:
+                    frame_small = cv2.resize(self.current_frame, (0, 0),
+                                             fx=self.resize_factor,
+                                             fy=self.resize_factor)
+                    rgb_small = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
+
+                    # Converter coordenadas
+                    small_locs = [
+                        (
+                            int(top * self.resize_factor),
+                            int(right * self.resize_factor),
+                            int(bottom * self.resize_factor),
+                            int(left * self.resize_factor)
+                        ) for (top, right, bottom, left) in self.current_face_locations
+                    ]
+
+                    self.current_face_labels, self.current_recognition_confidences = self.recognize_faces(
+                        rgb_small, small_locs, self.current_detection_confidences
+                    )
+
+                self.last_recognition_time = current_time
+
         except Exception as e:
-            print(f"Erro ao calcular métricas: {str(e)}")
-            return {}
+            print(f"Erro no ciclo de reconhecimento: {str(e)}")
 
-    def handle_unknown_face(self, face_encoding, frame, face_location):
+    def face_should_be_known(self, face_encoding):
+        """Verifica se o rosto deveria ser reconhecido com base nos encodings conhecidos"""
+        verification_threshold = self.distance_threshold * 0.7  # Threshold mais rigoroso
+        distances = face_recognition.face_distance(self.known_face_encodings, face_encoding)
+        return any(d <= verification_threshold for d in distances)
+
+    def update_smoothed_locations(self, new_locations):
+        """Aplica suavização exponencial nas coordenadas dos rostos"""
+        if not self.smoothed_locations:
+            self.smoothed_locations = new_locations.copy()
+            return
+
+        # Match mais próximo entre detecções atuais e suavizadas
+        matched = []
+        for new_loc in new_locations:
+            distances = [np.linalg.norm(np.array(new_loc) - np.array(smoothed))
+                         for smoothed in self.smoothed_locations]
+            if distances:
+                idx = np.argmin(distances)
+                matched.append((idx, new_loc))
+
+        # Atualizar posições suavizadas
+        updated = []
+        for idx, new_loc in matched:
+            smoothed = [
+                int(self.smoothed_locations[idx][i] * (1 - self.smoothing_factor) +
+                    new_loc[i] * self.smoothing_factor)
+                for i in range(4)
+            ]
+            updated.append(smoothed)
+
+        self.smoothed_locations = updated
+
+    def handle_unknown_face(self, face_encoding, face_location, det_conf, rec_conf):
         if not any(np.linalg.norm(known - face_encoding) < 0.5 for known in self.known_unknown_faces):
-            self.save_unknown_face(frame, face_location)
+            self.save_unknown_face(face_location, det_conf, rec_conf)
             self.known_unknown_faces.append(face_encoding)
 
-    def save_unknown_face(self, frame, face_location):
-        annotated_frame = frame.copy()
-        (top, right, bottom, left) = face_location
+    def save_unknown_face(self, face_location, det_conf, rec_conf):
+        # 1. Obter frame original atual
+        original_frame = self.current_frame.copy()
 
-        face_locations = [face_location]  # Lista com a localização do rosto desconhecido
-        face_labels = ["Desconhecido"]  # Label do rosto desconhecido
-        face_confidences = [0.0]  # Confiança (pode ser ajustada se necessário)
+        # 2. Converter coordenadas para o tamanho original
+        (top, right, bottom, left) = (
+            int(face_location[0] / self.resize_factor),
+            int(face_location[1] / self.resize_factor),
+            int(face_location[2] / self.resize_factor),
+            int(face_location[3] / self.resize_factor)
+        )
 
-        annotated_frame = self.annotate_frame(annotated_frame, face_locations, face_labels, face_confidences)
+        # 3. Garantir limites válidos
+        height, width = original_frame.shape[:2]
+        top = max(0, min(top, height))
+        bottom = max(0, min(bottom, height))
+        left = max(0, min(left, width))
+        right = max(0, min(right, width))
 
+        # 4. Criar frame anotado completo
+        annotated_frame = self.annotate_frame(
+            frame=original_frame,
+            face_locations=[(top, right, bottom, left)],
+            face_labels=["Desconhecido"],
+            detection_confidences=[det_conf],
+            recognition_confidences=[rec_conf],
+            fps=self.current_fps
+        )
+
+        # 5. Salvar frame completo com anotações
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = os.path.join(self.unknown_faces_folder, f"unknown_{timestamp}_{uuid.uuid4().hex}.jpg")
-
+        filename = os.path.join(self.unknown_faces_folder,
+                                f"unknown_full_{timestamp}_{uuid.uuid4().hex}.jpg")
         cv2.imwrite(filename, annotated_frame)
-        print(f"Rosto desconhecido salvo com anotações: {filename}")
 
-        self.trigger_alert_system()
+        # 6. (Opcional) Salvar também close-up do rosto
+        face_roi = original_frame[top:bottom, left:right]
+        if face_roi.size > 0:
+            cv2.imwrite(filename.replace("_full_", "_closeup_"), face_roi)
+
+        print(f"Frame completo salvo: {filename}")
 
     def trigger_alert_system(self):
         try:
             self.notification = NotificationWindow()
             self.notification.show()
-
             QTimer.singleShot(3000, self.notification.close)
-
             QApplication.processEvents()
+            self.show_system_notification()
+            self.play_alert_sound()
         except Exception as e:
             print(f"Erro na notificação: {str(e)}")
 
-    def show_system_notification(self):
-        try:
-            notification.notify(
-                title="ALERTA DE SEGURANÇA",
-                message="Rosto desconhecido detectado!",
-                app_name="Sistema de Reconhecimento Facial",
-                timeout=10
-            )
-        except Exception as e:
-            print(f"Erro na notificação do sistema: {str(e)}")
-            print("Certifique-se de ter o plyer instalado: pip install plyer")
-
-    def play_alert_sound(self):
-        try:
-            if platform.system() == "Windows":
-                winsound.Beep(1000, 1000)  # Frequência 1000Hz por 1 segundo
-            elif platform.system() == "Darwin":  # macOS
-                subprocess.run(["afplay", "/System/Library/Sounds/Sosumi.aiff"])
-            else:  # Linux
-                subprocess.run(["paplay", "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga"])
-        except Exception as e:
-            print(f"Erro no alerta sonoro: {str(e)}")
-            print("\a")
-
-    def annotate_frame(self, frame, face_locations, face_labels, face_confidences):
-        # Métricas em tempo real
+    def annotate_frame(self, frame, face_locations, face_labels,
+                       detection_confidences, recognition_confidences, fps):
+        # Calcular métricas atualizadas
         metrics = self.calculate_metrics()
-        y_offset = 30
 
-        # Desenha métricas principais
-        status = [
-            f"FPS: {metrics.get('fps', 0):.1f}",
-            f"Precisão: {metrics.get('accuracy', 0):.2%}",
-            f"Confiança Média: {metrics.get('avg_confidence', 0):.2f}",
-            f"Tempo/Frame: {metrics.get('avg_detection_time', 0):.3f}s"
+        # Criar texto das métricas
+        metrics_text = [
+            f"FPS: {self.current_fps:.1f}",
+            f"Conf Média: {metrics['avg_confidence']:.2f}",
+            f"Acurácia: {metrics['accuracy']:.2%}",
+            f"Faces: {metrics['faces_detected']}"
         ]
 
-        for text in status:
+        # Adicionar texto no frame
+        y_offset = 30
+        for text in metrics_text:
             cv2.putText(frame, text, (10, y_offset),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             y_offset += 30
 
-        # Desenha retângulos e labels
-        for (top, right, bottom, left), label, confidence in zip(face_locations, face_labels, face_confidences):
+        # Desenhar retângulos e labels dos rostos
+        for (top, right, bottom, left), label, det_conf, rec_conf in zip(
+                face_locations, face_labels, detection_confidences, recognition_confidences):
+            # Escolher cor baseado no reconhecimento
             color = (0, 0, 255) if label == "Desconhecido" else (0, 255, 0)
+
+            # Desenhar retângulo
             cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
 
-            text = f"{label} ({confidence:.2f})" if label != "Desconhecido" else label
-            cv2.putText(frame, text, (left + 6, bottom - 6),
+            # Criar texto do label
+            label_text = f"{label} ({rec_conf:.2f})"
+
+            # Calcular tamanho do texto para fundo
+            (text_width, text_height), _ = cv2.getTextSize(
+                label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+
+            # Desenhar fundo do texto
+            cv2.rectangle(frame,
+                          (left, bottom - text_height - 4),
+                          (left + text_width, bottom),
+                          color, cv2.FILLED)
+
+            # Escrever texto
+            cv2.putText(frame, label_text,
+                        (left + 4, bottom - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
         return frame
 
-    def generate_report(self, filename="performance_report.json"):
-        """Gera um relatório completo das métricas em JSON e no console"""
-        try:
-            report = self.calculate_metrics()
+    def calculate_metrics(self):
+        # Implementação completa das métricas
+        total_time = time.time() - self.metrics['start_time']
 
-            # Adiciona métricas adicionais ao relatório
-            report.update({
-                'total_faces': self.metrics['total_faces'],
-                'processing_frames': self.metrics['frame_counts'],
-                'unknown_faces_detected': len(self.known_unknown_faces)
-            })
+        tp = self.metrics['true_positive']
+        fp = self.metrics['false_positive']
+        tn = self.metrics['true_negative']
+        fn = self.metrics['false_negative']
 
-            # Salva em arquivo
-            with open(filename, 'w') as f:
-                json.dump(report, f, indent=4)
+        # Prevenir divisão por zero
+        total = (self.metrics['true_positive'] +
+                 self.metrics['false_positive'] +
+                 self.metrics['true_negative'] +
+                 self.metrics['false_negative'])
 
-            return report
+        # Cálculos com tratamento de divisão por zero
+        accuracy = (self.metrics['true_positive'] + self.metrics['true_negative']) / total if total > 0 else 0
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
 
-        except Exception as e:
-            print(f"Erro ao gerar relatório: {str(e)}")
-            return {}
+        return {
+            'total_time': round(total_time, 2),
+            'frames_processed': self.metrics['total_frames'],
+            'accuracy': accuracy,
+            'precision': round(precision, 4),
+            'recall': round(recall, 4),
+            'f1_score': round(f1, 4),
+            'avg_confidence': round(
+                np.mean(self.metrics['recognition_confidences']) if self.metrics['recognition_confidences'] else 0, 4),
+            'faces_detected': self.metrics['total_faces'],
+            'fps': round(self.metrics['total_frames'] / total_time, 2) if total_time > 0 else 0
+        }
 
-    def run(self):
+    def run(self, video_path="meu_video.mp4"):
         cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            print("Erro: Não foi possível abrir o vídeo.")
+            return
+
+        # Inicializa métricas
+        self.metrics['start_time'] = time.time()
+        self.metrics['total_frames'] = 0
         frame_count = 0
         start_time = time.time()
 
-        face_locs = []
-        face_labels = []
-        face_confs = []
+        # Estado do sistema
+        self.current_face_locations = []
+        self.current_detection_confidences = []
+        self.current_face_labels = []
+        self.current_recognition_confidences = []
 
         try:
             while True:
-                ret, frame = cap.read()
+                ret, self.current_frame = cap.read()
                 if not ret:
                     break
 
+                self.metrics['total_frames'] += 1
                 frame_count += 1
-                frame_time = time.time()
 
-                # Processamento do frame
-                frame_small = cv2.resize(frame, (0, 0), fx=self.resize_factor, fy=self.resize_factor)
-                rgb_small = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
+                # Executa o ciclo de reconhecimento
+                self.execute_recognition_cycle()
 
-                if frame_count % self.process_every_n_frames == 0:
-                    face_locs, face_labels, face_confs = self.detect_faces(frame_small, rgb_small, frame)
-                    if face_locs:  # Só atualiza se faces forem detectadas
-                        self.metrics['total_faces'] += len(face_locs)
-                        self.metrics['confidences'].extend(face_confs)
+                if (time.time() - start_time) >= 1.0:
+                    self.current_fps = frame_count / (time.time() - start_time)
+                    frame_count = 0
+                    start_time = time.time()
 
-                # Atualiza métricas de tempo
-                self.metrics['frame_counts'] += 1
-                self.metrics['processing_times'].append(time.time() - frame_time)
+                # Anotação do frame
+                annotated_frame = self.annotate_frame(
+                    frame=self.current_frame.copy(),
+                    face_locations=self.smoothed_locations if self.smoothed_locations else self.current_face_locations,
+                    face_labels=self.current_face_labels,
+                    detection_confidences=self.current_detection_confidences,
+                    recognition_confidences=self.current_recognition_confidences,
+                    fps=self.current_fps
+                )
 
-                # Exibe frame com métricas
-                frame = self.annotate_frame(frame, face_locs, face_labels, face_confs)
-                cv2.imshow("Sistema de Reconhecimento Facial - Métricas em Tempo Real", frame)
+                cv2.imshow("Sistema de Reconhecimento Facial", annotated_frame)
 
                 if cv2.waitKey(1) & 0xFF == ord('q'):
+                    print("Encerrando pela tecla 'q'...")
                     break
 
         finally:
-            # Garante a execução destes comandos mesmo com erro
             cap.release()
             cv2.destroyAllWindows()
-            cv2.waitKey(1)  # Limpeza adicional do OpenCV
+            self.generate_report()
 
-            report = self.generate_report()
-            if report:
-                print("\n--- Relatório Final da Sessão ---")
-                print(f"Tempo Total: {time.time() - start_time:.2f}s")
-                print(f"Frames Processados: {self.metrics['frame_counts']}")
-                print(f"Acurácia: {report.get('accuracy', 0):.2%}")
-                print(f"Precisão: {report.get('precision', 0):.2%}")
-                print(f"Recall: {report.get('recall', 0):.2%}")
-                print(f"F1-Score: {report.get('f1_score', 0):.2%}")
-                print(f"FPS Médio: {report.get('fps', 0):.1f}")
-                print(f"Confiança Média: {report.get('avg_confidence', 0):.2f}")
-            else:
-                print("Não foi possível gerar o relatório!")
+    def generate_report(self, filename="performance_report.json"):
+        metrics = self.calculate_metrics()
+
+        report = {
+            'performance_metrics': metrics,
+            'hardware_info': {
+                'os': platform.system(),
+                'processor': platform.processor(),
+                'opencv_version': cv2.__version__,
+            }
+        }
+
+        with open(filename, 'w') as f:
+            json.dump(report, f, indent=4)
+
+        with open(filename, 'w') as f:
+            json.dump(report, f, indent=4)
 
 
 if __name__ == "__main__":
