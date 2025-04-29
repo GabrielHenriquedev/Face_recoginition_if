@@ -38,19 +38,20 @@ class FaceRecognitionSystem:
         self.smoothing_factor = 0.5
 
         self.metrics = {
-            'true_positive': 0,
-            'false_positive': 0,
-            'true_negative': 0,
-            'false_negative': 0,
-            'total_faces': 0,
-            'detection_times': [],
-            'recognition_times': [],
-            'recognition_confidences': [],
-            'detection_confidences': [],
-            'start_time': time.time(),
+            'faces_detected': 0,
+            'known_faces_recognized': 0,
+            'unknown_faces_detected': 0,
+            'avg_confidence': [],
             'total_frames': 0,
-            'frame_counts': 0
+            'start_time': time.time()
         }
+
+        # Estado do sistema
+        self.current_frame = None
+        self.current_face_locations = []
+        self.current_detection_confidences = []
+        self.current_face_labels = []
+        self.current_recognition_confidences = []
 
         self.known_unknown_faces = []
         self.unknown_faces_folder = "unknown_faces"
@@ -59,6 +60,14 @@ class FaceRecognitionSystem:
 
     @staticmethod
     def load_known_faces(folder_path, cache_file="face_cache.pkl", min_faces_per_image=1):
+        if os.path.exists(cache_file):
+            folder_mtime = os.path.getmtime(folder_path)
+            cache_mtime = os.path.getmtime(cache_file)
+
+            if folder_mtime > cache_mtime:
+                os.remove(cache_file)
+                print("Cache antigo removido devido a alterações na pasta de fotos.")
+
         if os.path.exists(cache_file):
             with open(cache_file, "rb") as f:
                 return pickle.load(f)
@@ -143,12 +152,12 @@ class FaceRecognitionSystem:
         face_labels = []
         recognition_confidences = []
 
-        for idx, face_box in enumerate(face_locations):
+        for face_box in face_locations:
             try:
                 face_encodings = face_recognition.face_encodings(rgb_small_frame, [face_box])
                 if not face_encodings:
-                    recognition_confidences.append(0.0)
                     face_labels.append("Desconhecido")
+                    recognition_confidences.append(0.0)
                     continue
 
                 matches = face_recognition.compare_faces(
@@ -166,26 +175,14 @@ class FaceRecognitionSystem:
 
                 if matches[best_match_index]:
                     label = self.known_face_labels[best_match_index]
-                    self.metrics['true_positive'] += 1
+                    self.metrics['known_faces_recognized'] += 1
                 else:
                     label = "Desconhecido"
-                    # Usa o encoding facial para verificação
-                    if self.face_should_be_known(face_encodings[0]):
-                        self.metrics['false_negative'] += 1
-                    else:
-                        self.metrics['true_negative'] += 1
-
-                    self.handle_unknown_face(
-                        face_encodings[0],
-                        face_box,
-                        detection_confidences[idx],
-                        confidence
-                    )
+                    self.metrics['unknown_faces_detected'] += 1
 
                 face_labels.append(label)
                 recognition_confidences.append(confidence)
-                self.metrics['recognition_confidences'].append(confidence)
-                self.metrics['total_faces'] += 1
+                self.metrics['avg_confidence'].append(confidence)
 
             except Exception as e:
                 print(f"Erro no reconhecimento: {str(e)}")
@@ -195,9 +192,9 @@ class FaceRecognitionSystem:
         return face_labels, recognition_confidences
 
     def execute_recognition_cycle(self):
-        """Executa um ciclo completo de detecção e reconhecimento"""
         try:
-            # Passo 1: Detecção se necessário
+            if self.current_frame is None:  # Verificação crítica
+                return
             if (time.time() - self.last_detection_time) > self.detection_interval:
                 frame_small = cv2.resize(self.current_frame, (0, 0),
                                          fx=self.resize_factor,
@@ -208,9 +205,8 @@ class FaceRecognitionSystem:
                     self.current_face_locations = new_locs
                     self.current_detection_confidences = new_confs
                     self.last_detection_time = time.time()
+                    self.metrics['faces_detected'] += len(new_locs)  # Atualiza faces detectadas
 
-
-            # Passo 2: Reconhecimento sempre com o frame mais recente
             current_time = time.time()
             if (current_time - self.last_recognition_time) >= self.recognition_interval:
                 if self.current_face_locations:
@@ -219,7 +215,6 @@ class FaceRecognitionSystem:
                                              fy=self.resize_factor)
                     rgb_small = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
 
-                    # Converter coordenadas
                     small_locs = [
                         (
                             int(top * self.resize_factor),
@@ -336,9 +331,8 @@ class FaceRecognitionSystem:
 
         # Criar texto das métricas
         metrics_text = [
-            f"FPS: {self.current_fps:.1f}",
+            f"FPS: {fps:.1f}",
             f"Conf Média: {metrics['avg_confidence']:.2f}",
-            f"Acurácia: {metrics['accuracy']:.2%}",
             f"Faces: {metrics['faces_detected']}"
         ]
 
@@ -379,37 +373,19 @@ class FaceRecognitionSystem:
         return frame
 
     def calculate_metrics(self):
-        # Implementação completa das métricas
         total_time = time.time() - self.metrics['start_time']
-
-        tp = self.metrics['true_positive']
-        fp = self.metrics['false_positive']
-        tn = self.metrics['true_negative']
-        fn = self.metrics['false_negative']
-
-        # Prevenir divisão por zero
-        total = (self.metrics['true_positive'] +
-                 self.metrics['false_positive'] +
-                 self.metrics['true_negative'] +
-                 self.metrics['false_negative'])
-
-        # Cálculos com tratamento de divisão por zero
-        accuracy = (self.metrics['true_positive'] + self.metrics['true_negative']) / total if total > 0 else 0
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+        avg_conf = (np.mean(self.metrics['avg_confidence'])
+                    if self.metrics['avg_confidence'] else 0)
 
         return {
-            'total_time': round(total_time, 2),
-            'frames_processed': self.metrics['total_frames'],
-            'accuracy': accuracy,
-            'precision': round(precision, 4),
-            'recall': round(recall, 4),
-            'f1_score': round(f1, 4),
-            'avg_confidence': round(
-                np.mean(self.metrics['recognition_confidences']) if self.metrics['recognition_confidences'] else 0, 4),
-            'faces_detected': self.metrics['total_faces'],
-            'fps': round(self.metrics['total_frames'] / total_time, 2) if total_time > 0 else 0
+            'total_time': total_time,
+            'faces_detected': self.metrics['faces_detected'],
+            'known_faces': self.metrics['known_faces_recognized'],
+            'unknown_faces': self.metrics['unknown_faces_detected'],
+            'avg_confidence': round(avg_conf, 2),
+            'fps': round(self.metrics['total_frames'] / total_time, 1) if total_time > 0 else 0,
+            'total_time_seconds': round(total_time, 2),
+
         }
 
     def run(self, video_path="meu_video.mp4"):
@@ -418,17 +394,9 @@ class FaceRecognitionSystem:
             print("Erro: Não foi possível abrir o vídeo.")
             return
 
-        # Inicializa métricas
         self.metrics['start_time'] = time.time()
-        self.metrics['total_frames'] = 0
         frame_count = 0
         start_time = time.time()
-
-        # Estado do sistema
-        self.current_face_locations = []
-        self.current_detection_confidences = []
-        self.current_face_labels = []
-        self.current_recognition_confidences = []
 
         try:
             while True:
@@ -439,9 +407,9 @@ class FaceRecognitionSystem:
                 self.metrics['total_frames'] += 1
                 frame_count += 1
 
-                # Executa o ciclo de reconhecimento
                 self.execute_recognition_cycle()
 
+                # Atualiza FPS a cada segundo
                 if (time.time() - start_time) >= 1.0:
                     self.current_fps = frame_count / (time.time() - start_time)
                     frame_count = 0
@@ -473,15 +441,12 @@ class FaceRecognitionSystem:
 
         report = {
             'performance_metrics': metrics,
+            'session_duration': f"{metrics['total_time']:.2f} segundos",
             'hardware_info': {
                 'os': platform.system(),
-                'processor': platform.processor(),
                 'opencv_version': cv2.__version__,
             }
         }
-
-        with open(filename, 'w') as f:
-            json.dump(report, f, indent=4)
 
         with open(filename, 'w') as f:
             json.dump(report, f, indent=4)
