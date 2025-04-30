@@ -1,6 +1,8 @@
 import sys
+import traceback
+
 from PyQt5.QtWidgets import QWidget, QLabel, QPushButton, QVBoxLayout, QMessageBox, QApplication
-from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtCore import QThread, pyqtSignal, Qt
 from rec_facial.rec_facial_cnn import FaceRecognitionSystem
 from views.Cad_view import FaceRecognitionForm
 from views.style import MAIN_STYLES, BUTTON_STYLES
@@ -73,12 +75,24 @@ class MenuFaceRecognition(QWidget):
 
     def open_form(self):
         try:
-            self.form_screen = FaceRecognitionForm(parent_menu=self)
-            self.form_screen.setStyleSheet(MAIN_STYLES)  # Herda estilos
+            # Fecha o menu completamente se necessário
+            if hasattr(self, 'form_screen'):
+                self.form_screen.close()
+
+            # Cria nova instância mantendo a referência
+            self.form_screen = FaceRecognitionForm()
+            self.form_screen.setStyleSheet(MAIN_STYLES)
+
+            # Configura relação pai-filho corretamente
+            self.form_screen.setWindowModality(Qt.NonModal)
             self.form_screen.show()
+
+            # Esconde o menu sem destruí-lo
             self.hide()
+
         except Exception as e:
-            self.show_error(f"Não foi possível abrir o formulário: {str(e)}")
+            error_msg = f"Erro ao abrir formulário: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            QMessageBox.critical(self, "Erro Crítico", error_msg)
 
     def start_system(self):
         try:
